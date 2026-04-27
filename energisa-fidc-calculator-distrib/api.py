@@ -224,6 +224,8 @@ async def calculate(
     index_file: UploadFile | None = File(default=None),
     recovery_file: UploadFile | None = File(default=None),
     di_pre_file: UploadFile | None = File(default=None),
+    di_pre_taxa_manual: float = Form(default=12.0),
+    di_pre_prazo_manual: int = Form(default=6),
     data_base: str | None = Form(default=None),
     spread_percent: float = Form(default=0.025),
     prazo_horizonte: int = Form(default=6),
@@ -253,6 +255,11 @@ async def calculate(
         di_df = None
         if di_pre_file is not None:
             di_df = eng.load_di_pre_from_excel(_read_upload(di_pre_file))
+        else:
+            di_df = pd.DataFrame({
+            "meses_futuros": list(range(1, di_pre_prazo_manual + 1)),
+            "252": [di_pre_taxa_manual] * di_pre_prazo_manual,
+        })
 
         result_df = eng.calculate(
             df=df_base,
