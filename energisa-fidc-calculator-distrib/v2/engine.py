@@ -518,7 +518,11 @@ def parse_date_col(series: pd.Series) -> pd.Series:
     m2 = parsed.isna()
     if m2.any():
         parsed = parsed.copy()
-        parsed[m2] = pd.to_datetime(s[m2], dayfirst=True, errors="coerce")
+        parsed[m2] = pd.to_datetime(s[m2], format="%Y-%m-%d %H:%M:%S", errors="coerce")
+    m3 = parsed.isna()
+    if m3.any():
+        parsed = parsed.copy()
+        parsed[m3] = pd.to_datetime(s[m3], dayfirst=True, errors="coerce")
     return parsed
 
 
@@ -724,8 +728,9 @@ def calculate(
     if "data_base" not in df.columns or df["data_base"].isna().all():
         df["data_base"] = data_base or datetime.today().strftime("%Y-%m-%d")
     else:
-        df["data_base"] = parse_date_col(df["data_base"]).dt.strftime("%Y-%m-%d").where(
-            parse_date_col(df["data_base"]).notna(), other=data_base or datetime.today().strftime("%Y-%m-%d")
+        data_base_parsed = parse_date_col(df["data_base"])
+        df["data_base"]= data_base_parsed.dt.strftime("%Y-%m-%d").where(
+            data_base_parsed.notna(), other=data_base or datetime.today().strftime("%Y-%m-%d")
         )
 
     # ── Empresa / tipo defaults ─────────────────────────────────────────
