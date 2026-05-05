@@ -6,8 +6,14 @@ This module exposes the calculation engine.
 from __future__ import annotations
 
 import io
+import json
+import os
+import re
+import urllib.error
+import urllib.request
 from datetime import datetime
 from typing import Any
+from uuid import uuid4
 
 import pandas as pd
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -31,12 +37,63 @@ app.add_middleware(
 )
 
 
-def _read_upload(upload: UploadFile) -> io.BytesIO:
-    content = upload.file.read()
+def _buffer_from_bytes(content: bytes, filename: str | None) -> io.BytesIO:
     buffer = io.BytesIO(content)
-    buffer.name = upload.filename or "upload.xlsx"
+    buffer.name = filename or "upload.xlsx"
     buffer.seek(0)
     return buffer
+
+
+async def _read_upload(upload: UploadFile) -> tuple[bytes, io.BytesIO]:
+    content = await upload.read()
+    return content, _buffer_from_bytes(content, upload.filename)
+
+
+def _safe_storage_name(filename: str | None) -> str:
+    name = filename or "upload.xlsx"
+    name = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-")
+    return name or "upload.xlsx"
+
+
+def _upload_to_supabase_storage(content: bytes, filename: str | None, folder: str) -> dict[str, Any] | None:
+    """Uploads to Supabase Storage through Railway backend when env vars are present."""
+    supabase_url = os.getenv("SUPABASE_URL", "").rstrip("/")
+    service_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_ANON_KEY")
+    bucket = os.getenv("SUPABASE_STORAGE_BUCKET", "fidc-uploads")
+
+    if not supabase_url or not service_key:
+        return None
+
+    safe_name = _safe_storage_name(filename)
+    object_path = f"{folder}/{datetime.utcnow().strftime('%Y/%m/%d')}/{uuid4().hex}-{safe_name}"
+    upload_url = f"{supabase_url}/storage/v1/object/{bucket}/{object_path}"
+    request = urllib.request.Request(
+        upload_url,
+        data=content,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {service_key}",
+            "apikey": service_key,
+            "Content-Type": "application/octet-stream",
+            "x-upsert": "true",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            body = response.read().decode("utf-8") or "{}"
+            return {
+                "bucket": bucket,
+                "path": object_path,
+                "status_code": response.status,
+                "response": json.loads(body),
+            }
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError) as exc:
+        return {
+            "bucket": bucket,
+            "path": object_path,
+            "error": str(exc),
+        }
 
 
 def _normalize_data_base(value: str | None) -> str:
@@ -150,10 +207,23 @@ def _coerce_table(df: pd.DataFrame, kind: str) -> pd.DataFrame:
 def _standardize_base(df: pd.DataFrame, source_name: str, data_base: str, is_voltz_global: bool) -> pd.DataFrame:
     source_name_upper = source_name.upper()
     mapping = eng.auto_detect_columns(list(df.columns))
+    return _standardize_base_with_mapping(df, source_name, data_base, is_voltz_global, mapping)
+
+
+def _standardize_base_with_mapping(
+    df: pd.DataFrame,
+    source_name: str,
+    data_base: str,
+    is_voltz_global: bool,
+    mapping: dict[str, str] | None,
+) -> pd.DataFrame:
+    source_name_upper = source_name.upper()
+    mapping = mapping or eng.auto_detect_columns(list(df.columns))
 
     standardized = pd.DataFrame(index=df.index)
     for internal_name, source_column in mapping.items():
-        standardized[internal_name] = df[source_column]
+        if source_column in df.columns:
+            standardized[internal_name] = df[source_column]
 
     if "valor_principal" not in standardized.columns and "valor_principal" in df.columns:
         standardized["valor_principal"] = df["valor_principal"]
@@ -206,13 +276,16 @@ def health() -> dict[str, str]:
 @app.post("/preview")
 async def preview(data_file: UploadFile = File(...)) -> dict[str, Any]:
     try:
-        df = eng.read_uploaded_file(_read_upload(data_file))
+        content, buffer = await _read_upload(data_file)
+        storage = _upload_to_supabase_storage(content, data_file.filename, "previews")
+        df = eng.read_uploaded_file(buffer)
         return {
             "filename": data_file.filename,
             "rows": int(len(df)),
             "columns": list(df.columns),
             "detected_mapping": eng.auto_detect_columns(list(df.columns)),
             "preview": df.head(5).to_dict(orient="records"),
+            "storage": storage,
         }
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -231,30 +304,50 @@ async def calculate(
     prazo_horizonte: int = Form(default=6),
     is_voltz_global: bool = Form(default=False),
     output: str = Form(default="json"),
+    mapping_json: str | None = Form(default=None),
 ) -> Any:
     try:
         resolved_data_base = _normalize_data_base(data_base)
-        df_base = eng.read_uploaded_file(_read_upload(data_file))
-        df_base = _standardize_base(
+        data_content, data_buffer = await _read_upload(data_file)
+        storage_uploads: dict[str, Any] = {
+            "data_file": _upload_to_supabase_storage(data_content, data_file.filename, "bases")
+        }
+
+        df_base = eng.read_uploaded_file(data_buffer)
+        custom_mapping = None
+        if mapping_json:
+            parsed_mapping = json.loads(mapping_json)
+            if not isinstance(parsed_mapping, dict):
+                raise ValueError("mapping_json precisa ser um objeto JSON")
+            custom_mapping = {str(key): str(value) for key, value in parsed_mapping.items() if value}
+
+        df_base = _standardize_base_with_mapping(
             df_base,
             source_name=data_file.filename or "base.xlsx",
             data_base=resolved_data_base,
             is_voltz_global=is_voltz_global,
+            mapping=custom_mapping,
         )
 
         idx_df = eng.build_index_series()
         if index_file is not None:
-            loaded_idx = eng.load_indices_from_excel(_read_upload(index_file))
+            index_content, index_buffer = await _read_upload(index_file)
+            storage_uploads["index_file"] = _upload_to_supabase_storage(index_content, index_file.filename, "indices")
+            loaded_idx = eng.load_indices_from_excel(index_buffer)
             if loaded_idx is not None and not loaded_idx.empty:
                 idx_df = loaded_idx
 
         taxa_df = None
         if recovery_file is not None:
-            taxa_df = eng.load_recovery_rates_from_excel(_read_upload(recovery_file))
+            recovery_content, recovery_buffer = await _read_upload(recovery_file)
+            storage_uploads["recovery_file"] = _upload_to_supabase_storage(recovery_content, recovery_file.filename, "taxas")
+            taxa_df = eng.load_recovery_rates_from_excel(recovery_buffer)
 
         di_df = None
         if di_pre_file is not None:
-            di_df = eng.load_di_pre_from_excel(_read_upload(di_pre_file))
+            di_content, di_buffer = await _read_upload(di_pre_file)
+            storage_uploads["di_pre_file"] = _upload_to_supabase_storage(di_content, di_pre_file.filename, "di-pre")
+            di_df = eng.load_di_pre_from_excel(di_buffer)
         else:
             di_df = pd.DataFrame({
             "meses_futuros": list(range(1, di_pre_prazo_manual + 1)),
@@ -276,6 +369,7 @@ async def calculate(
         normalized_output = output.lower().strip()
         if normalized_output == "csv":
             csv_bytes = eng.to_csv_bytes(result_df)
+            _upload_to_supabase_storage(csv_bytes, "fidc_resultado.csv", "resultados")
             return StreamingResponse(
                 io.BytesIO(csv_bytes),
                 media_type="text/csv",
@@ -284,6 +378,7 @@ async def calculate(
 
         if normalized_output == "excel":
             xlsx_bytes = eng.to_excel_bytes(result_df, summary)
+            _upload_to_supabase_storage(xlsx_bytes, "fidc_resultado.xlsx", "resultados")
             return StreamingResponse(
                 io.BytesIO(xlsx_bytes),
                 media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -296,6 +391,7 @@ async def calculate(
             "rows": int(len(result_df)),
             "summary": summary,
             "preview": result_df.head(50).to_dict(orient="records"),
+            "storage": storage_uploads,
         }
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
