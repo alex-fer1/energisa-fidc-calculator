@@ -22,7 +22,11 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+.next/
+next.user-config.*
 
+# Environment variables
+.env*.local
 
 .venv
 *.xlsx
@@ -36,3 +40,4 @@ dist-ssr
 *test*
 *RESUMO*
 __pycache__
+
